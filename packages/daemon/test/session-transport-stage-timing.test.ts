@@ -176,6 +176,8 @@ describe("SessionTransport stage timing", () => {
       expect(result.ok, JSON.stringify({ reason: result.reason, error: result.error }).slice(0, 1000)).toBe(true);
       expect(timer.records.map((record) => record.site)).toEqual([
         "session_transport.pre_capture",
+        // Claude Code: the input box is read before the paste (draft stash, rig-send-draft).
+        "session_transport.composer_capture",
         "session_transport.send_text",
         "session_transport.submit",
         "session_transport.post_capture",

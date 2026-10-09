@@ -13,6 +13,7 @@ import { wrapPaneEnvelope, appendDeliveredSegment, type EnvelopeScope } from "..
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { isShellForeground } from "./shell-classifier.js";
+import { readClaudeComposer, type ClaudeComposerRead } from "./claude-composer.js";
 import { observeClaudeDelivery, verifyCodexPaneProcess, type ClaudeDeliveryObservation, type NativeProcessLister } from "./native-process-lineage.js";
 import type { SlowOperationInstrumentation } from "./slow-op-recorder.js";
 import { hashSentText, type CaptureObserverSink, type CaptureSlot, type ObservationInput, type ObservedBinding } from "./capture-observer.js";
@@ -776,6 +777,9 @@ export interface SendResult {
   reason?: string;
   /** Set on the submit-only (bare Enter) mode's success — no text was typed. */
   submitOnly?: boolean;
+  /** Claude Code: the input box held a person's unsent draft. It was stashed with Claude's own
+   * ctrl+s so the message submitted alone; `restored` means the draft is back in the box, unsubmitted. */
+  draft?: "restored" | "restore-unconfirmed";
   activity?: AgentActivity;
   waitedMs?: number;
   attempts?: number;
@@ -1433,6 +1437,7 @@ export class SessionTransport {
     // success result via `warning` so the honest telemetry is surfaced.
     let sendAdvisory: string | undefined;
     let promptOverride = false;
+    let draftRefusal: SendResult | null = null;
     if (waitForIdleMs === undefined) {
       const readiness = await this.classifySendReadiness({
         sessionName,
@@ -1444,7 +1449,17 @@ export class SessionTransport {
       // Single state dispatch (B1 code-review fix): flattened so `unknown` ALWAYS attaches the advisory
       // regardless of whether --dangerously-interact was passed — the deliberate-override branch no
       // longer bypasses unknown handling.
-      if (readiness.state === "needs_input") {
+      if (readiness.state === "needs_input" && readiness.reason === "prompt_draft" && runtime === "claude-code" && !opts?.dangerouslyInteract) {
+        // A draft is not a prompt to answer: the input-boundary step below stashes it, or refuses
+        // as before when it cannot read the box.
+        draftRefusal = {
+          ok: false,
+          sessionName,
+          reason: "target_needs_input",
+          activity: readiness,
+          error: `Refused: '${sessionName}' is at an interactive prompt (${readiness.reason}). A message must not select or approve it. To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>". No text was sent.`,
+        };
+      } else if (readiness.state === "needs_input") {
         // The POSITIVE picker/approval footgun. --dangerously-interact is the deliberate audited
         // override (reason required + an auditable record persisted BEFORE the send; fail closed if it
         // cannot be audited so an unauditable override never sends). Otherwise refuse with the
@@ -1532,6 +1547,21 @@ export class SessionTransport {
     const targetFailure = await checkClaudeTarget();
     if (targetFailure) return observe(targetFailure);
 
+    // Claude Code: a person's unsent draft must not be submitted with the message. Stash it with
+    // Claude's own ctrl+s (text, cursor, mode and pasted blocks); Claude puts it back in the box
+    // when the message is submitted. An unreadable box keeps today's behaviour: proceed, unless
+    // the readiness check already recognised a draft there.
+    let stashedDraft = false;
+    if (runtime === "claude-code" && !promptOverride) {
+      const stash = await this.stashClaudeDraft(sessionName, opts);
+      if (stash.state === "refused") return observe({ ok: false, sessionName, sent: false, reason: "target_needs_input",
+        error: `Refused: '${sessionName}' has an unsent draft in its input box and ${stash.why}. The message was not pasted.` });
+      if (stash.state === "unread" && draftRefusal) return observe(draftRefusal);
+      stashedDraft = stash.state === "stashed";
+    } else if (draftRefusal) {
+      return observe(draftRefusal);
+    }
+
     // 3. Deliver ordinary messages as paste, audited prompt answers as key input.
     if (observed) observed.sentHash = hashSentText(text);
     const textResult = await this.runStage(
@@ -1587,7 +1617,15 @@ export class SessionTransport {
       });
     }
 
-    const interaction = promptOverride ? { promptInteraction: "enter-sent" as const } : {};
+    const interaction: Pick<SendResult, "promptInteraction" | "draft"> = promptOverride ? { promptInteraction: "enter-sent" as const } : {};
+    if (stashedDraft) {
+      const restored = await this.restoreStashedDraft(sessionName, opts);
+      interaction.draft = restored ? "restored" : "restore-unconfirmed";
+      const note = restored
+        ? "draft: the recipient's unsent draft was stashed, the message submitted on its own, and the draft put back in the input box unsubmitted."
+        : "draft: the recipient's unsent draft was stashed and the message submitted on its own, but the draft was not seen back in the input box. Claude keeps it stashed: ctrl+s on an empty box restores it.";
+      sendAdvisory = [sendAdvisory, note].filter(Boolean).join(" ");
+    }
 
     // 6. Verify if requested. At this point text + Enter BOTH succeeded, so the
     // message LANDED; the capture only re-confirms the render. Not re-confirming
@@ -1616,6 +1654,69 @@ export class SessionTransport {
     }
 
     return observe({ ok: true, sessionName, ...interaction, ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+  }
+
+  private async readComposer(sessionName: string): Promise<ClaudeComposerRead> {
+    const adapter = this.tmuxAdapter as Partial<Pick<TmuxAdapter, "capturePaneStyled">>;
+    if (typeof adapter.capturePaneStyled !== "function") return { state: "unknown", reason: "styled_capture_unavailable" };
+    const styled = await this.runStage("session_transport.composer_capture",
+      () => adapter.capturePaneStyled!.call(this.tmuxAdapter, sessionName, 40)).catch(() => null);
+    return readClaudeComposer(styled);
+  }
+
+  /** Re-read the box a few times while Claude redraws; returns the first read that settles. */
+  private async pollComposer(sessionName: string, settled: (read: ClaudeComposerRead) => boolean): Promise<ClaudeComposerRead> {
+    let read: ClaudeComposerRead = { state: "unknown", reason: "not_read" };
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await this.sleep(150);
+      read = await this.readComposer(sessionName);
+      if (settled(read)) return read;
+    }
+    return read;
+  }
+
+  private pressKey(sessionName: string, key: string, opts?: SendOpts) {
+    return this.runStage(
+      "session_transport.composer_key",
+      () => { opts?.beforeWrite?.(); return opts?.beforeWrite ? this.tmuxAdapter.sendKeys(sessionName, [key], opts.beforeWrite) : this.tmuxAdapter.sendKeys(sessionName, [key]); },
+      (result) => result.ok ? "ok" : "failed",
+    );
+  }
+
+  /** Claude's ctrl+s stashes a non-empty box and, on an empty box, pops an existing stash: press it
+   * only on a draft we can see, and never over a stash the person already holds. */
+  private async stashClaudeDraft(sessionName: string, opts?: SendOpts): Promise<
+    { state: "empty" | "unread" | "stashed" } | { state: "refused"; why: string }
+  > {
+    const composer = await this.readComposer(sessionName);
+    if (composer.state === "unknown") return { state: "unread" };
+    if (composer.state === "empty") return { state: "empty" };
+    if (composer.stashed) return { state: "refused", why: "Claude already holds a stashed prompt there, which stashing the draft would replace" };
+    const key = await this.pressKey(sessionName, "C-s", opts);
+    if (!key.ok) return { state: "refused", why: `the draft could not be stashed (${key.message})` };
+    const after = await this.pollComposer(sessionName, (read) => read.state === "empty" && read.stashed);
+    if (after.state === "empty" && after.stashed) return { state: "stashed" };
+    return { state: "refused", why: after.state === "draft"
+      ? "it was still in the box after ctrl+s"
+      : "the box could not be confirmed empty after ctrl+s. If the draft is no longer visible, Claude has stashed it: ctrl+s on an empty box restores it" };
+  }
+
+  /** Claude restores the stash when the message is submitted. If the box is empty with the stash
+   * still held (a submit path that skipped the restore), pop it with ctrl+s. */
+  private async restoreStashedDraft(sessionName: string, opts?: SendOpts): Promise<boolean> {
+    // Until Claude processes the Enter, the box still shows the message with the stash held.
+    const settled = (read: ClaudeComposerRead) => (read.state === "draft" && !read.stashed) || (read.state === "empty" && read.stashed);
+    const after = await this.pollComposer(sessionName, settled);
+    if (after.state === "draft") return !after.stashed;
+    if (after.state !== "empty" || !after.stashed) return false;
+    // ctrl+s on a box Claude has just refilled would stash the draft again: confirm the empty read.
+    const again = await this.pollComposer(sessionName, settled);
+    if (again.state === "draft") return !again.stashed;
+    if (again.state !== "empty" || !again.stashed) return false;
+    const key = await this.pressKey(sessionName, "C-s", opts);
+    if (!key.ok) return false;
+    const popped = await this.pollComposer(sessionName, (read) => read.state === "draft");
+    return popped.state === "draft" && !popped.stashed;
   }
 
   private runStage<T>(

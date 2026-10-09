@@ -1090,6 +1090,18 @@ export class TmuxAdapter {
     }
   }
 
+  /** Like capturePaneContent, with styles kept (`-e`), so faint suggestion text is distinguishable. */
+  async capturePaneStyled(paneId: string, lines: number = 40): Promise<string | null> {
+    const target = exactTarget(paneId, "pane");
+    try {
+      const output = await this.run(["tmux", "capture-pane", "-p", "-e", "-t", target, "-S", `-${lines}`],
+        `tmux capture-pane -p -e -t ${shellQuote(target)} -S -${lines}`);
+      return output || null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Capture the currently VISIBLE pane screen (no scrollback). Returns null if
    * unavailable. The live-terminal seed (OPR.0.4.0.38) must use the visible

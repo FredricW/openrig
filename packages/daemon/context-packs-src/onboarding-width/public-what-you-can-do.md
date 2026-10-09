@@ -464,7 +464,9 @@ version, from checking the environment to a useful report to the OpenRig team.
 - **`rig seat set-typing-guard <seat> --enabled true|false --reason <text>`** — protect a human's
   draft in that seat: automatic input is retained instead of typed while the guard is on.
   **`rig seat held-messages`** lists what was retained and **`rig seat retire-held-message`**
-  retires one; disabling the guard does not replay held messages.
+  retires one; disabling the guard does not replay held messages. Without the guard, a message to
+  a Claude Code seat whose input box holds a person's unsent draft stashes the draft with Claude's
+  own ctrl+s, submits the message on its own, and the draft returns to the box unsubmitted.
 - **`rig compact-plan`** → **`rig compact`** — who is near the context wall, then act on it.
   **Ordering matters: running `compact` without the plan is guessing which seat needed it.**
   Managed compaction waits for the seat's restore map before compacting; `rig compact --state`,
